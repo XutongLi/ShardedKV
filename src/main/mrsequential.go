@@ -89,6 +89,7 @@ func main() {
 //
 // load the application Map and Reduce functions
 // from a plugin file, e.g. ../mrapps/wc.so
+// returned function map <k1, v1> -> list(<k2, v2>)		reduce <k2, list(v2)> -> list(v2)
 //
 func loadPlugin(filename string) (func(string, string) []mr.KeyValue, func(string, []string) string) {
 	p, err := plugin.Open(filename)
