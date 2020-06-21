@@ -18,7 +18,7 @@ type ApplyForTaskArgs struct {
 }
 
 type ApplyForTaskReply struct {
-	Status				int		// 0 - success, assigned a task   1 - retry, there aren't any idle map tasks, and reduce tasks aren't assigned  2 - all tasks finished, exit
+	Status				int		// 0 - success, assigned a task   1 - retry, no tasks can be assigned  2 - all tasks finished, exit
 	TaskType			int		// 0 - map  1 - reduce
 	FileName			string	// intput file of map task
 	MapIndex 			int		// index of file, for naming the intermedia files

@@ -177,6 +177,8 @@ func (m *Master) server() {
 // if the entire job has finished.
 //
 func (m *Master) Done() bool {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
 	ret := m.allMapFinished && m.allReduceFinished
 	return ret
 }

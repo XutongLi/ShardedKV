@@ -14,6 +14,7 @@ import "syscall"
 import "time"
 import "io/ioutil"
 
+// get num of parallel workers
 func nparallel(phase string) int {
 	// create a file so that other workers will see that
 	// we're running at the same time as them.
