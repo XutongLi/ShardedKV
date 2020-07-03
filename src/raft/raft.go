@@ -210,6 +210,11 @@ func (rf *Raft) electionTimeoutTimer() {
 	for {
 		rf.mu.Lock()
 		timeline := rf.lastHeartBeatTime.Add(rf.electionTimeout)
+		if rf.killed() {
+			defer rf.mu.Unlock()
+			DPrintf("[%d-%s-%d] is killed", rf.me, rf.state, rf.currentTerm)
+			return
+		}
 		if rf.state != LEADER && timeline.Before(time.Now()) {
 			go rf.startElection()
 			//DPrintf("[%d-%s-%d] fail and here", rf.me, rf.state, rf.currentTerm)
@@ -386,6 +391,11 @@ func (rf *Raft) heartbeatTimer() {
 	rf.mu.Unlock()
 	for {
 		rf.mu.Lock()
+		if rf.killed() {
+			defer rf.mu.Unlock()
+			DPrintf("[%d-%s-%d] is killed", rf.me, rf.state, rf.currentTerm)
+			return
+		}
 		if rf.state != LEADER {		// when this peer is no longer a leader, stop heartbeat timer
 			defer rf.mu.Unlock()
 			return
