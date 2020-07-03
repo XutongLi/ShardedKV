@@ -1,7 +1,10 @@
 package raft
 
-import "log"
-
+import (
+	"log"
+	"time"
+	"math/rand"
+)
 // Debugging
 const Debug = 0
 
@@ -10,4 +13,9 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 		log.Printf(format, a...)
 	}
 	return
+}
+
+func RandTimeout(mini int, maxi int) int {
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+	return mini + r.Intn(maxi - mini)
 }
