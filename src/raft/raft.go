@@ -22,6 +22,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"bytes"
+	"../labgob"
 )
 
 
@@ -80,12 +82,12 @@ type Raft struct {
 	// state a Raft server must maintain.
 
 	state 				string				// state of server
-	currentTerm			int					// latest term server has seen (initialized to 0 on first boot, increases monotonically)
-	votedFor			int					// candidateId that revceived vote in current term (or null if none)
+	currentTerm			int					// (persistent) latest term server has seen (initialized to 0 on first boot, increases monotonically)
+	votedFor			int					// (persistent) candidateId that revceived vote in current term (or null if none)
 	commitIndex			int					// index of highest log entry known to be committed (initialized to 0, increases monotonically)
 	lastApplied			int					// index of highest log entry appelied to state machine (initialized to 0, increases monotonically)
 
-	logs				[]LogEntry			// array of log entries
+	logs				[]LogEntry			// (persistent) array of log entries
 
 	// on leader
 	nextIndex			[]int				// for each server, index of the next log entry to send to that server (initialized to leader last log index + 1)
@@ -118,13 +120,13 @@ func (rf *Raft) GetState() (int, bool) {
 //
 func (rf *Raft) persist() {
 	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	writer := new(bytes.Buffer)
+	encoder := labgob.NewEncoder(writer)
+	encoder.Encode(rf.currentTerm)
+	encoder.Encode(rf.votedFor)
+	encoder.Encode(rf.logs)
+	data := writer.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 
@@ -136,18 +138,20 @@ func (rf *Raft) readPersist(data []byte) {
 		return
 	}
 	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	reader := bytes.NewBuffer(data)
+	decoder := labgob.NewDecoder(reader)
+	var currentTerm int
+	var votedFor int
+	var logs []LogEntry
+	if decoder.Decode(&currentTerm) != nil ||
+	   	decoder.Decode(&votedFor) != nil ||
+		decoder.Decode(&logs) != nil {
+		DPrintf("[%d] decode error", rf.me)
+	} else {
+	  rf.currentTerm = currentTerm
+	  rf.votedFor = votedFor
+	  rf.logs = logs
+	}
 }
 
 // reset random election timeout and the time of last heart beat
@@ -162,6 +166,7 @@ func (rf *Raft) convertToCandidate() {
 	rf.state = CANDIDATE
 	rf.currentTerm += 1
 	rf.votedFor = rf.me
+	rf.persist()
 	DPrintf("[%d-%s-%d] start a election\n", rf.me, rf.state, rf.currentTerm)
 	DPrintf("[%d-%s-%d] last heartbeat is %v, election time is %v", rf.me, rf.state, rf.currentTerm, rf.lastHeartBeatTime, rf.electionTimeout)
 	DPrintf("%v", time.Now())
@@ -188,6 +193,7 @@ func (rf *Raft) convertToFollower(newTerm int) {
 	rf.currentTerm = newTerm
 	rf.votedFor = NOTVOTED
 	rf.resetElectionTimeout()
+	rf.persist()
 	DPrintf("[%d-%s-%d] become follower\n", rf.me, rf.state, rf.currentTerm)
 }
 
@@ -329,7 +335,7 @@ func (rf *Raft) startElection() {
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
 	Term 			int 	// candidate's term
-	CandidateId	int 	// candidate requesting vote
+	CandidateId		int 	// candidate requesting vote
 	LastLogIndex 	int 	// index of candidate's last log entry
 	LastLogTerm 	int 	// term of candidate's last log entry
 }
@@ -371,6 +377,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.votedFor = args.CandidateId
 		reply.VoteGranted = true
 		rf.resetElectionTimeout()
+		rf.persist()
 		DPrintf("[%d-%s-%d] vote for %d", rf.me, rf.state, rf.currentTerm, args.CandidateId)
 	} else {
 		DPrintf("[%d-%s-%d] refuse to vote for %d", rf.me, rf.state, rf.currentTerm, args.CandidateId)
@@ -612,6 +619,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		for _, entry := range args.Entries {
 			rf.logs = append(rf.logs, entry)
 		}
+		rf.persist()
 		DPrintf("[%d-%s-%d] append log entries success", rf.me, rf.state, rf.currentTerm)
 	}
 	// check new commit
@@ -692,6 +700,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		index = newEntry.Index
 		term = newEntry.Term
 		rf.logs = append(rf.logs, newEntry)
+		rf.persist()
 		DPrintf("[%d-%s-%d] get new command %v of index %d", rf.me, rf.state, rf.currentTerm, command, index)
 	} else {
 		isLeader = false

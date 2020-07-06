@@ -69,12 +69,11 @@ func (m *Master) ApplyForTask(args *ApplyForTaskArgs, reply *ApplyForTaskReply) 
 			if mapDetail.status == 2 {	// finished
 				continue
 			} else if mapDetail.status == 1 { // processing
-				timeout := m.mapTask[index].startTime.Add(10 * time.Second).Before(time.Now())
-				if !timeout {
+				timeDuration := time.Since(m.mapTask[index].startTime)
+				if timeDuration < 10 * time.Second {
 					continue
 				}
 			}
-			// mapDetail.status == 1 && timeout  ||  mapDetail.status == 0
 			m.mapTask[index].status = 1
 			m.mapTask[index].startTime = time.Now()
 			reply.Status = 0
@@ -94,12 +93,11 @@ func (m *Master) ApplyForTask(args *ApplyForTaskArgs, reply *ApplyForTaskReply) 
 			if reduceDetial.status == 2 {	// finished
 				continue
 			} else if reduceDetial.status == 1 {	// processing
-				timeout := m.reduceTask[index].startTime.Add(10 * time.Second).Before(time.Now())
-				if !timeout {
+				timeDuration := time.Since(m.reduceTask[index].startTime)
+				if timeDuration < 10 * time.Second {
 					continue
 				}
 			}
-			// reduceDetail.status == 1 && timeout  ||  reduceDetail.status == 0
 			m.reduceTask[index].status = 1
 			m.reduceTask[index].startTime = time.Now()
 			reply.Status = 0
