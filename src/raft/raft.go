@@ -57,7 +57,7 @@ const (
 	ELECTION_TIMEOUT_MIN 	int = 400
 	ELECTION_TIMEOUT_MAX 	int = 600
 	HEARTBEAT_INTERVAL 		int = 100
-	ELECTION_INTERVAL		int = 100
+	ELECTION_INTERVAL		int = 30
 )
 
 // data structure of log entry
@@ -613,13 +613,33 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		//	copy(newLogs, rf.logs)
 		//	rf.logs = newLogs
 		//}
-		newLogs := make([]LogEntry, args.PrevLogIndex + 1)
-		copy(newLogs, rf.logs)	// if not use copy(), there would be a race warning (-race)
-		rf.logs = newLogs
-		for _, entry := range args.Entries {
-			rf.logs = append(rf.logs, entry)
+
+		hasConfict := false
+		thisIdx := args.PrevLogIndex + 1
+		entriesIdx := 0
+		for ; entriesIdx < len(args.Entries); entriesIdx += 1 {
+			if thisIdx >= len(rf.logs) || args.Entries[entriesIdx].Term != rf.logs[thisIdx].Term {
+				hasConfict = true
+				break
+			}
+			thisIdx += 1
 		}
-		rf.persist()
+		if hasConfict {
+			newLogs := make([]LogEntry, thisIdx)
+			copy(newLogs, rf.logs)	// if not use copy(), there would be a race warning (-race)
+			rf.logs = newLogs
+			for ; entriesIdx < len(args.Entries); entriesIdx += 1 {
+				rf.logs = append(rf.logs, args.Entries[entriesIdx])
+			}
+			rf.persist()
+		}
+		//newLogs := make([]LogEntry, args.PrevLogIndex + 1)
+		//copy(newLogs, rf.logs)	// if not use copy(), there would be a race warning (-race)
+		//rf.logs = newLogs
+		//for _, entry := range args.Entries {
+		//	rf.logs = append(rf.logs, entry)
+		//}
+		//rf.persist()
 		DPrintf("[%d-%s-%d] append log entries success", rf.me, rf.state, rf.currentTerm)
 	}
 	// check new commit
