@@ -54,10 +54,10 @@ const (
 	LEADER 					string = "leader"
 	FOLLOWER 				string = "follower"
 	CANDIDATE 				string = "candidate"
-	ELECTION_TIMEOUT_MIN 	int = 400
-	ELECTION_TIMEOUT_MAX 	int = 600
+	ELECTION_TIMEOUT_MIN 	int = 300
+	ELECTION_TIMEOUT_MAX 	int = 500
 	HEARTBEAT_INTERVAL 		int = 100
-	ELECTION_INTERVAL		int = 30
+	ELECTION_INTERVAL		int = 10
 )
 
 // data structure of log entry
