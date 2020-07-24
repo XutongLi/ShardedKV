@@ -3,15 +3,15 @@ package kvraft
 import (
 	"../labgob"
 	"../labrpc"
-	"log"
 	"../raft"
+	"bytes"
+	"log"
 	"sync"
 	"sync/atomic"
-	"fmt"
 	"time"
 )
 
-const Debug = 1
+const Debug = 0
 
 // print debug log
 func DPrintf(format string, a ...interface{}) (n int, err error) {
@@ -45,6 +45,7 @@ type Op struct {
 	OpType 		string
 	OpId		int64
 	ClientId 	int64
+	Ch 			chan Record
 }
 
 type KVServer struct {
@@ -55,11 +56,12 @@ type KVServer struct {
 	dead    			int32 // set by Kill()
 
 	maxraftstate 		int // snapshot if log grows this big
+	killChan 			chan bool
 
 	// Your definitions here.
 	kvStorage			map[string]string		// kv storage
 	lastAppliedIndex	int
-	clientOpRecord 		map[string]Record		// historical records <clientId-opId, record>
+	clientOpId 			map[int64]int64
 }
 
 // Get RPC Handler
@@ -72,10 +74,14 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		OpType:   GET,
 		OpId:     args.OpId,
 		ClientId: args.ClientId,
+		Ch:    	  make(chan Record),
 	}
-	err, value := kv.execRaft(op)
-	reply.Err = err
-	reply.Value = value
+	ok, record := kv.execRaft(op)
+	reply.Err = record.Err
+	if !ok {
+		reply.Err = ErrWrongLeader
+	}
+	reply.Value = record.Value
 }
 
 // PutAppendRPC Handler
@@ -88,46 +94,53 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		OpType:   args.Op,
 		OpId:     args.OpId,
 		ClientId: args.ClientId,
+		Ch:    	  make(chan Record),
 	}
-	err, _ := kv.execRaft(op)
-	reply.Err = err
+	ok, record := kv.execRaft(op)
+	reply.Err = record.Err
+	if !ok {
+		reply.Err = ErrWrongLeader
+	}
 }
 
 // append log entry to raft, and check the applied result
-func (kv *KVServer) execRaft(op Op) (Err, string) {
+func (kv *KVServer) execRaft(op Op) (bool, Record) {
 	kv.mu.Lock()
-	defer kv.mu.Unlock()
 
-	term, isLeader := kv.rf.GetState()
+	if op.OpId > 0 && kv.isRepeated(op.ClientId, op.OpId, false) {
+		defer kv.mu.Unlock()
+		return true, Record{}
+	}
+
+	_, _, isLeader := kv.rf.Start(op)		// give an op to raft
 	if !isLeader {
-		return ErrWrongLeader, ""
-	}
-
-	clientOp := fmt.Sprintf("%v-%v", op.ClientId, op.OpId)
-	if record, dup := kv.clientOpRecord[clientOp]; dup {	// check duplicate
-		return record.Err, record.Value
-	}
-	kv.rf.Start(op)		// give an op to raft
-
-	curTime := time.Now()
-	for {
-		kv.mu.Unlock()
-		time.Sleep(time.Duration(APPLYCHECKINTERVAL) * time.Millisecond)
-		kv.mu.Lock()
-
-		if kv.killed() || time.Since(curTime) > time.Duration(APPLYCHECKTIMEOUT) * time.Millisecond {
-			break
+		defer kv.mu.Unlock()
+		return false, Record{}
 		}
-		curTerm, _ := kv.rf.GetState()
-		if curTerm != term {	// the leader has changed
-			break
-		}
-		record, ok := kv.clientOpRecord[clientOp]
-		if ok { 		// op result has applied
-			return record.Err, record.Value
-		}
+	kv.mu.Unlock()
+
+	kv.saveSnapShot()	// check raft size after log is appended
+
+	select {
+		case record := <- op.Ch:
+			return true, record
+		case <- time.After(time.Millisecond * APPLYCHECKTIMEOUT):
+
 	}
-	return ErrWrongLeader, ""
+	return false, Record{}
+}
+
+// true if is repeated
+func (kv *KVServer) isRepeated(clientId int64, OpId int64, update bool) bool {
+	res := false
+	index, ok := kv.clientOpId[clientId]
+	if ok {
+		res = index >= OpId
+	}
+	if update && !res {
+		kv.clientOpId[clientId] = OpId
+	}
+	return res
 }
 
 //
@@ -144,6 +157,7 @@ func (kv *KVServer) Kill() {
 	atomic.StoreInt32(&kv.dead, 1)
 	kv.rf.Kill()
 	// Your code here, if desired.
+	kv.killChan <- true
 }
 
 func (kv *KVServer) killed() bool {
@@ -155,42 +169,99 @@ func (kv *KVServer) killed() bool {
 // get applyMsg gouroutine
 func (kv *KVServer) applyCommitEntry() {
 	for {
-		applyMsg := <-kv.applyCh
-		kv.lastAppliedIndex = applyMsg.CommandIndex
-		op := applyMsg.Command.(Op)
+		select {
+			case <-kv.killChan:
+				return
+			case applyMsg := <-kv.applyCh:
+				op := applyMsg.Command.(Op)
+				if !applyMsg.CommandValid {
+					kv.updateSnapshot(applyMsg.Snapshot)
+					kv.mu.Lock()
+					kv.lastAppliedIndex = applyMsg.CommandIndex
+					kv.mu.Unlock()
+					// kv.saveSnapShot()
+					continue
+				}
 
-		// apply op to kv storage
-		kv.mu.Lock()
-		clientOp := fmt.Sprintf("%v-%v", op.ClientId, op.OpId)
-		if _, dup := kv.clientOpRecord[clientOp]; !dup {
-			if op.OpType == GET {
-				value, hasKey := kv.kvStorage[op.Key]
-				if !hasKey {
-					kv.clientOpRecord[clientOp] = Record{ErrNoKey, ""}
+				kv.mu.Lock()
+				kv.lastAppliedIndex = applyMsg.CommandIndex
+				record := Record{}
+				if op.OpType == GET {
+					value, hasKey := kv.kvStorage[op.Key]
+					if !hasKey {
+						record.Value = ""
+						record.Err = ErrNoKey
+					} else {
+						record.Value = value
+						record.Err = OK
+					}
+				} else if op.OpType == PUT {
+					if !kv.isRepeated(op.ClientId, op.OpId, true) {
+						kv.kvStorage[op.Key] = op.Value
+					}
+					record.Err = OK
+				} else if op.OpType == APPEND {
+					if !kv.isRepeated(op.ClientId, op.OpId, true) {
+						value, hasKey := kv.kvStorage[op.Key]
+						if !hasKey {
+							kv.kvStorage[op.Key] = op.Value
+						} else {
+							kv.kvStorage[op.Key] = value + op.Value
+						}
+					}
+					record.Err = OK
 				} else {
-					kv.clientOpRecord[clientOp] = Record{OK, value}
+					DPrintf("[Server %d] applied a unkown op", kv.me)
 				}
-				DPrintf("[Server %d] apply GET, key - %v", kv.me, op.Key)
-			} else if op.OpType == PUT {
-				kv.kvStorage[op.Key] = op.Value
-				kv.clientOpRecord[clientOp] = Record{OK, ""}
-				DPrintf("[Server %d] apply PUT <%v, %v>", kv.me, op.Key, op.Value)
-			} else if op.OpType == APPEND {
-				value, hasKey := kv.kvStorage[op.Key]
-				if !hasKey {
-					kv.kvStorage[op.Key] = op.Value
-				} else {
-					kv.kvStorage[op.Key] = value + op.Value
+				kv.mu.Unlock()
+
+				select {
+					case op.Ch <- record:
+					default:
 				}
-				kv.clientOpRecord[clientOp] = Record{OK, ""}
-				DPrintf("[Server %d] apply APPEND <%v, %v>", kv.me, op.Key, op.Value)
-			} else {
-				DPrintf("[Server %d] applied a unkown op", kv.me)
-			}
+
 		}
-		kv.mu.Unlock()
 	}
 }
+
+// snapshot
+
+func (kv *KVServer) saveSnapShot() {
+	if kv.maxraftstate == -1 || kv.rf.RaftStateSize() < kv.maxraftstate {
+		return
+	}
+	kv.mu.Lock()
+	writer := new(bytes.Buffer)
+	encoder := labgob.NewEncoder(writer)
+	encoder.Encode(kv.kvStorage)
+	encoder.Encode(kv.clientOpId)
+	snapshot := writer.Bytes()
+	lastAppliedIndex := kv.lastAppliedIndex
+	kv.mu.Unlock()
+	kv.rf.SaveStateAndSnapshot(lastAppliedIndex, snapshot)
+}
+
+func (kv *KVServer) updateSnapshot(snapshot []byte) {
+	if snapshot == nil || len(snapshot) < 1 {
+		return
+	}
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	reader := bytes.NewBuffer(snapshot)
+	decoder := labgob.NewDecoder(reader)
+	kvStorage := make(map[string]string)
+	clientOpId := make(map[int64]int64)
+	if decoder.Decode(&kvStorage) != nil ||
+		decoder.Decode(&clientOpId) != nil {
+		DPrintf("[Server %d] decode fails", kv.me)
+	} else {
+		kv.kvStorage = kvStorage
+		kv.clientOpId = clientOpId
+		//kv.lastAppliedIndex = lastAppliedIndex
+	}
+}
+
 //
 // servers[] contains the ports of the set of
 // servers that will cooperate via Raft to
@@ -215,15 +286,15 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.maxraftstate = maxraftstate
 
 	// You may need initialization code here.
-
+	kv.killChan = make(chan bool)
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
 	kv.kvStorage = make(map[string]string)
-	//kv.clientLastOpId = make(map[int64]int64)
-	kv.clientOpRecord = make(map[string]Record)
 	kv.lastAppliedIndex = 0
+	kv.clientOpId = make(map[int64]int64)
+	kv.updateSnapshot(kv.rf.ReadSnapshot())
 
 	go kv.applyCommitEntry()
 	return kv
