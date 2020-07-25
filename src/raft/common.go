@@ -72,7 +72,11 @@ type Raft struct {
 	lastHeartBeatTime	time.Time			// time of receiving last heartbeat
 
 	applyCh 			chan ApplyMsg		// message applied to state machine
-	triggerApply		chan bool 			// trigger apply committed log entry
+	//triggerApply		chan bool 			// trigger apply committed log entry
+
+	// snapshot
+	lastSnapshotIndex 	int 				// last index in snapshot
+
 }
 
 //
@@ -114,4 +118,17 @@ type AppendEntriesReply struct {
 	ConflictTerm	int 		// term of the conflict log entry
 	ConflictIndex 	int 		// index of first log entry in conflict term
 	LastIndex		int 		// the last log index of follower logs
+}
+
+// InstallSnapshot RPC arguments structure
+type InstallSnapshotArgs struct {
+	Term 				int 	// leader's term
+	LeaderId 			int		// so follower can redict clients
+	LastIncludedIndex	int		// the snaspshot replaces all entries up through and including this index
+	LastIncludedTerm 	int		// term of lastIncludedIndex
+	Data 				[]byte	// raw bytes of snapshot
+}
+
+type InstallSnapshotReply struct {
+	Term 				int 	// currentTerm, for leader to update itself
 }

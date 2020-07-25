@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-const Debug = 0
+const Debug = 1
 
 // print debug log
 func DPrintf(format string, a ...interface{}) (n int, err error) {
@@ -119,7 +119,7 @@ func (kv *KVServer) execRaft(op Op) (bool, Record) {
 		}
 	kv.mu.Unlock()
 
-	kv.saveSnapShot()	// check raft size after log is appended
+	//kv.saveSnapShot()	// check raft size after log is appended
 
 	select {
 		case record := <- op.Ch:
@@ -173,7 +173,6 @@ func (kv *KVServer) applyCommitEntry() {
 			case <-kv.killChan:
 				return
 			case applyMsg := <-kv.applyCh:
-				op := applyMsg.Command.(Op)
 				if !applyMsg.CommandValid {
 					kv.updateSnapshot(applyMsg.Snapshot)
 					kv.mu.Lock()
@@ -183,6 +182,7 @@ func (kv *KVServer) applyCommitEntry() {
 					continue
 				}
 
+				op := applyMsg.Command.(Op)
 				kv.mu.Lock()
 				kv.lastAppliedIndex = applyMsg.CommandIndex
 				record := Record{}
@@ -219,6 +219,7 @@ func (kv *KVServer) applyCommitEntry() {
 					case op.Ch <- record:
 					default:
 				}
+				kv.saveSnapShot()
 
 		}
 	}
