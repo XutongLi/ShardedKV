@@ -7,9 +7,9 @@
   * [x] **Lab 2A** - leader election and heartbeat
   * [x] **Lab 2B** - append entries and apply committed entries
   * [x] **Lab 2C** - persist
-* [ ] **Lab 3** 
-  * [ ] **Lab 3A**
-  * [ ] **Lab 3B**
+* [x] **Lab 3** 
+  * [x] **Lab 3A** - KV service
+  * [x] **Lab 3B** - KV service with snapshot
 * [ ] **Lab 4**
   * [ ] **Lab 4A**
   * [ ] **Lab 4B**

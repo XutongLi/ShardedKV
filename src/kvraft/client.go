@@ -8,10 +8,9 @@ import (
 )
 
 
-
+// client clerk structure
 type Clerk struct {
 	servers 	[]*labrpc.ClientEnd
-	// You will have to modify this struct.
 	clientId	int64		// Id of this client
 	leaderId	int			// Id of the leader server this client connect to (or the previous leaderId)
 	opId 		int64		// current operation Id of this client
@@ -28,7 +27,6 @@ func nrand() int64 {
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
-	// You'll have to add code here.
 	ck.clientId = nrand()
 	ck.leaderId = 0
 	ck.opId = 0
@@ -40,15 +38,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // returns "" if the key does not exist.
 // keeps trying forever in the face of all other errors.
 //
-// you can send an RPC with code like this:
-// ok := ck.servers[i].Call("KVServer.Get", &args, &reply)
-//
-// the types of args and reply (including whether they are pointers)
-// must match the declared types of the RPC handler function's
-// arguments. and reply must be passed as a pointer.
-//
 func (ck *Clerk) Get(key string) string {
-	// You will have to modify this function.
 	val := ""
 	getArgs := GetArgs{
 		Key:      	key,
@@ -62,13 +52,13 @@ func (ck *Clerk) Get(key string) string {
 			ck.leaderId = (ck.leaderId + 1) % len(ck.servers)	// choose another server
 			continue
 		}
-		DPrintf("[Client %d] <Resp> Get op gets resp from server %d", ck.clientId, ck.leaderId)
+		DPrintf("[Client %d] <Resp> Get op gets resp from server %d", ck.clientId, getReply.ServerId)
 		if getReply.Err == ErrNoKey {
 			val = ""
-			DPrintf("[Client %d] <Resp> Get op -- no key %v", ck.clientId, key)
+			//DPrintf("[Client %d] <Resp> Get op -- no key %v", ck.clientId, key)
 		} else {	// getReply.Err == OK
 			val = getReply.Value
-			DPrintf("[Client %d] <Resp> Get op -- <%v, %v>", ck.clientId, key, val)
+			//DPrintf("[Client %d] <Resp> Get op -- <%v, %v>", ck.clientId, key, val)
 		}
 		break
 	}
@@ -78,15 +68,7 @@ func (ck *Clerk) Get(key string) string {
 //
 // shared by Put and Append.
 //
-// you can send an RPC with code like this:
-// ok := ck.servers[i].Call("KVServer.PutAppend", &args, &reply)
-//
-// the types of args and reply (including whether they are pointers)
-// must match the declared types of the RPC handler function's
-// arguments. and reply must be passed as a pointer.
-//
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	// You will have to modify this function.
 	putAppendArgs := PutAppendArgs{
 		Key:      key,
 		Value:    value,
@@ -103,9 +85,9 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		}
 		DPrintf("[Client %d] <Resp> %v op gets resp from server %d", ck.clientId, op, ck.leaderId)
 		if putAppendReply.Err == OK {
-			DPrintf("[Client %d] <Resp> %v <%v, %v> success", ck.clientId, op, key, value)
+			//DPrintf("[Client %d] <Resp> %v <%v, %v> success", ck.clientId, op, key, value)
 		} else {
-			DPrintf("[Client %d] <Resp> %v <%v, %v> fails", ck.clientId, op, key, value)
+			//DPrintf("[Client %d] <Resp> %v <%v, %v> fails", ck.clientId, op, key, value)
 		}
 		break
 	}

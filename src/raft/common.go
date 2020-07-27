@@ -52,10 +52,6 @@ type Raft struct {
 	me        			int                 // this peer's index into peers[]
 	dead      			int32               // set by Kill()
 
-	// Your data here (2A, 2B, 2C).
-	// Look at the paper's Figure 2 for a description of what
-	// state a Raft server must maintain.
-
 	state 				string				// state of server
 	currentTerm			int					// (persistent) latest term server has seen (initialized to 0 on first boot, increases monotonically)
 	votedFor			int					// (persistent) candidateId that revceived vote in current term (or null if none)
@@ -72,7 +68,6 @@ type Raft struct {
 	lastHeartBeatTime	time.Time			// time of receiving last heartbeat
 
 	applyCh 			chan ApplyMsg		// message applied to state machine
-	//triggerApply		chan bool 			// trigger apply committed log entry
 
 	// snapshot
 	lastSnapshotIndex 	int 				// last index in snapshot
@@ -81,10 +76,8 @@ type Raft struct {
 
 //
 // RequestVote RPC arguments structure.
-// field names must start with capital letters!
 //
 type RequestVoteArgs struct {
-	// Your data here (2A, 2B).
 	Term 			int 	// candidate's term
 	CandidateId		int 	// candidate requesting vote
 	LastLogIndex 	int 	// index of candidate's last log entry
@@ -92,11 +85,7 @@ type RequestVoteArgs struct {
 }
 
 
-// example RequestVote RPC reply structure.
-// field names must start with capital letters!
-//
 type RequestVoteReply struct {
-	// Your data here (2A).
 	Term 			int 	// currentTerm, for candidate to update itself
 	VoteGranted		bool 	// true means candidate received vote
 }
@@ -114,10 +103,8 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term 			int			// currentTerm, for leader to update itself
 	Success			bool		// true if follower contained entry matching prevLogIndex and prevLogTerm
-	IsConflict		bool 		// true if there is conflict, false if there is log missing
 	ConflictTerm	int 		// term of the conflict log entry
 	ConflictIndex 	int 		// index of first log entry in conflict term
-	LastIndex		int 		// the last log index of follower logs
 }
 
 // InstallSnapshot RPC arguments structure

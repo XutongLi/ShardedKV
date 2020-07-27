@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-const Debug = 1
+const Debug = 0
 
 // print debug log
 func DPrintf(format string, a ...interface{}) (n int, err error) {
@@ -25,27 +25,15 @@ const (
 	PUT		= "Put"
 	APPEND	= "Append"
 	GET 	= "Get"
-	APPLYCHECKINTERVAL	= 10	// time interval of apply message check
 	APPLYCHECKTIMEOUT = 700		// timeout of apply message check
 )
 
-// entry of historical records
-type Record struct {
-	Err		Err
-	Value 	string
-}
-
-
 type Op struct {
-	// Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
 	Key 		string
 	Value 		string
 	OpType 		string
 	OpId		int64
 	ClientId 	int64
-	Ch 			chan Record
 }
 
 type KVServer struct {
@@ -57,90 +45,84 @@ type KVServer struct {
 
 	maxraftstate 		int // snapshot if log grows this big
 	killChan 			chan bool
-
-	// Your definitions here.
+	persist 			*raft.Persister
 	kvStorage			map[string]string		// kv storage
-	lastAppliedIndex	int
-	clientOpId 			map[int64]int64
+	clientOpId 			map[int64]int64			// <clientId, max OpId of this client >
+	opChan				map[int]chan Op			// <index, chan>
 }
 
 // Get RPC Handler
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
-	DPrintf("[Server %d] get GET request from %d, key is %v", kv.me, args.ClientId, args.Key)
 	op := Op{
 		Key:      args.Key,
 		Value:    "",
 		OpType:   GET,
 		OpId:     args.OpId,
 		ClientId: args.ClientId,
-		Ch:    	  make(chan Record),
 	}
-	ok, record := kv.execRaft(op)
-	reply.Err = record.Err
-	if !ok {
-		reply.Err = ErrWrongLeader
+	reply.ServerId = kv.me
+	reply.Err = ErrWrongLeader
+	getOp, success := kv.execRaft(op)
+	if !success {
+		return
 	}
-	reply.Value = record.Value
+	if kv.equalTo(op, getOp) {
+		reply.Err = OK
+		kv.mu.Lock()
+		reply.Value = kv.kvStorage[op.Key]
+		kv.mu.Unlock()
+	}
 }
 
 // PutAppendRPC Handler
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
-	DPrintf("[Server %d] get %v request from %d, <%v, %v>", kv.me, args.Op, args.ClientId, args.Key, args.Value)
 	op := Op{
 		Key:      args.Key,
 		Value:    args.Value,
 		OpType:   args.Op,
 		OpId:     args.OpId,
 		ClientId: args.ClientId,
-		Ch:    	  make(chan Record),
 	}
-	ok, record := kv.execRaft(op)
-	reply.Err = record.Err
-	if !ok {
-		reply.Err = ErrWrongLeader
+	reply.ServerId = kv.me
+	reply.Err = ErrWrongLeader
+	getOp, success := kv.execRaft(op)
+	if !success {
+		return
+	}
+	if kv.equalTo(op, getOp) {
+		reply.Err = OK
 	}
 }
 
-// append log entry to raft, and check the applied result
-func (kv *KVServer) execRaft(op Op) (bool, Record) {
-	kv.mu.Lock()
-
-	if op.OpId > 0 && kv.isRepeated(op.ClientId, op.OpId, false) {
-		defer kv.mu.Unlock()
-		return true, Record{}
-	}
-
-	_, _, isLeader := kv.rf.Start(op)		// give an op to raft
+// send command to raft, and wait for applying
+func (kv *KVServer) execRaft(op Op) (Op, bool) {
+	logIndex, _, isLeader := kv.rf.Start(op)
 	if !isLeader {
-		defer kv.mu.Unlock()
-		return false, Record{}
-		}
-	kv.mu.Unlock()
-
-	//kv.saveSnapShot()	// check raft size after log is appended
-
-	select {
-		case record := <- op.Ch:
-			return true, record
-		case <- time.After(time.Millisecond * APPLYCHECKTIMEOUT):
-
+		return Op{}, false
 	}
-	return false, Record{}
+	DPrintf("[Server %d] get %v request from %d, <%v, %v>", kv.me, op, op.ClientId, op.Key, op.Value)
+	opCh := kv.putOpCh(logIndex)
+	select {
+	case getOp := <-opCh:
+		return getOp, true
+	case <- time.After(time.Duration(APPLYCHECKTIMEOUT) * time.Millisecond):
+		return Op{}, false
+	}
 }
 
-// true if is repeated
-func (kv *KVServer) isRepeated(clientId int64, OpId int64, update bool) bool {
-	res := false
-	index, ok := kv.clientOpId[clientId]
-	if ok {
-		res = index >= OpId
+// set op channel by log index
+func (kv *KVServer) putOpCh(index int) chan Op {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	if _, ok := kv.opChan[index]; !ok {
+		kv.opChan[index] = make(chan Op, 1)
 	}
-	if update && !res {
-		kv.clientOpId[clientId] = OpId
-	}
-	return res
+	return kv.opChan[index]
+}
+
+//Check that a and b are equal
+func (kv *KVServer) equalTo(a Op, b Op) bool {
+	return a.ClientId == b.ClientId && a.OpId == b.OpId && a.Key == b.Key && a.Value == b.Value && a.OpType == b.OpType
 }
 
 //
@@ -156,7 +138,6 @@ func (kv *KVServer) isRepeated(clientId int64, OpId int64, update bool) bool {
 func (kv *KVServer) Kill() {
 	atomic.StoreInt32(&kv.dead, 1)
 	kv.rf.Kill()
-	// Your code here, if desired.
 	kv.killChan <- true
 }
 
@@ -170,78 +151,54 @@ func (kv *KVServer) killed() bool {
 func (kv *KVServer) applyCommitEntry() {
 	for {
 		select {
-			case <-kv.killChan:
-				return
-			case applyMsg := <-kv.applyCh:
-				if !applyMsg.CommandValid {
-					kv.updateSnapshot(applyMsg.Snapshot)
-					kv.mu.Lock()
-					kv.lastAppliedIndex = applyMsg.CommandIndex
-					kv.mu.Unlock()
-					// kv.saveSnapShot()
-					continue
-				}
-
-				op := applyMsg.Command.(Op)
-				kv.mu.Lock()
-				kv.lastAppliedIndex = applyMsg.CommandIndex
-				record := Record{}
-				if op.OpType == GET {
-					value, hasKey := kv.kvStorage[op.Key]
-					if !hasKey {
-						record.Value = ""
-						record.Err = ErrNoKey
-					} else {
-						record.Value = value
-						record.Err = OK
-					}
-				} else if op.OpType == PUT {
-					if !kv.isRepeated(op.ClientId, op.OpId, true) {
-						kv.kvStorage[op.Key] = op.Value
-					}
-					record.Err = OK
+		case <- kv.killChan:
+			return
+		case applyMsg := <- kv.applyCh:
+			if !applyMsg.CommandValid {
+				kv.updateSnapshot(applyMsg.Snapshot)
+				continue
+			}
+			op := applyMsg.Command.(Op)
+			kv.mu.Lock()
+			maxOpId, hasClient := kv.clientOpId[op.ClientId]
+			if !hasClient || op.OpId > maxOpId {	// not repeated
+				if op.OpType == PUT {
+					kv.kvStorage[op.Key] = op.Value
 				} else if op.OpType == APPEND {
-					if !kv.isRepeated(op.ClientId, op.OpId, true) {
-						value, hasKey := kv.kvStorage[op.Key]
-						if !hasKey {
-							kv.kvStorage[op.Key] = op.Value
-						} else {
-							kv.kvStorage[op.Key] = value + op.Value
-						}
-					}
-					record.Err = OK
-				} else {
-					DPrintf("[Server %d] applied a unkown op", kv.me)
+					kv.kvStorage[op.Key] += op.Value
 				}
-				kv.mu.Unlock()
-
-				select {
-					case op.Ch <- record:
-					default:
-				}
-				kv.saveSnapShot()
-
+				kv.clientOpId[op.ClientId] = op.OpId
+			}
+			kv.mu.Unlock()
+			opCh := kv.putOpCh(applyMsg.CommandIndex)
+			go kv.saveSnapShot(applyMsg.CommandIndex)
+			// send op to opCh
+			select {
+			case <- opCh:	// clear the buffered channel
+			default:
+			}
+			opCh <- op		// send op
 		}
 	}
 }
 
-// snapshot
-
-func (kv *KVServer) saveSnapShot() {
+// save snapshot
+func (kv *KVServer) saveSnapShot(lastSnapshotIndex int) {
+	kv.mu.Lock()
 	if kv.maxraftstate == -1 || kv.rf.RaftStateSize() < kv.maxraftstate {
+		defer kv.mu.Unlock()
 		return
 	}
-	kv.mu.Lock()
 	writer := new(bytes.Buffer)
 	encoder := labgob.NewEncoder(writer)
 	encoder.Encode(kv.kvStorage)
 	encoder.Encode(kv.clientOpId)
 	snapshot := writer.Bytes()
-	lastAppliedIndex := kv.lastAppliedIndex
 	kv.mu.Unlock()
-	kv.rf.SaveStateAndSnapshot(lastAppliedIndex, snapshot)
+	kv.rf.SaveStateAndSnapshot(lastSnapshotIndex, snapshot)
 }
 
+// read snapshot
 func (kv *KVServer) updateSnapshot(snapshot []byte) {
 	if snapshot == nil || len(snapshot) < 1 {
 		return
@@ -253,13 +210,13 @@ func (kv *KVServer) updateSnapshot(snapshot []byte) {
 	decoder := labgob.NewDecoder(reader)
 	kvStorage := make(map[string]string)
 	clientOpId := make(map[int64]int64)
+
 	if decoder.Decode(&kvStorage) != nil ||
 		decoder.Decode(&clientOpId) != nil {
 		DPrintf("[Server %d] decode fails", kv.me)
 	} else {
 		kv.kvStorage = kvStorage
 		kv.clientOpId = clientOpId
-		//kv.lastAppliedIndex = lastAppliedIndex
 	}
 }
 
@@ -285,15 +242,13 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv := new(KVServer)
 	kv.me = me
 	kv.maxraftstate = maxraftstate
-
-	// You may need initialization code here.
-	kv.killChan = make(chan bool)
+	kv.persist = persister
+	kv.killChan = make(chan bool, 1)
 	kv.applyCh = make(chan raft.ApplyMsg)
-	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
-	// You may need initialization code here.
+	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	kv.kvStorage = make(map[string]string)
-	kv.lastAppliedIndex = 0
+	kv.opChan = make(map[int]chan Op)
 	kv.clientOpId = make(map[int64]int64)
 	kv.updateSnapshot(kv.rf.ReadSnapshot())
 
