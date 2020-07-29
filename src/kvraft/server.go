@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-const Debug = 0
+const Debug = 1
 
 // print debug log
 func DPrintf(format string, a ...interface{}) (n int, err error) {
@@ -46,6 +46,7 @@ type KVServer struct {
 	maxraftstate 		int // snapshot if log grows this big
 	killChan 			chan bool
 	persist 			*raft.Persister
+	lastApplied		 	int
 	kvStorage			map[string]string		// kv storage
 	clientOpId 			map[int64]int64			// <clientId, max OpId of this client >
 	opChan				map[int]chan Op			// <index, chan>
@@ -100,7 +101,7 @@ func (kv *KVServer) execRaft(op Op) (Op, bool) {
 	if !isLeader {
 		return Op{}, false
 	}
-	DPrintf("[Server %d] get %v request from %d, <%v, %v>", kv.me, op, op.ClientId, op.Key, op.Value)
+	//DPrintf("[Server %d] get %v request from %d, <%v, %v>", kv.me, op, op.ClientId, op.Key, op.Value)
 	opCh := kv.putOpCh(logIndex)
 	select {
 	case getOp := <-opCh:
@@ -155,11 +156,16 @@ func (kv *KVServer) applyCommitEntry() {
 			return
 		case applyMsg := <- kv.applyCh:
 			if !applyMsg.CommandValid {
-				kv.updateSnapshot(applyMsg.Snapshot)
+				kv.updateSnapshot(applyMsg.Snapshot, applyMsg.CommandIndex)
+				DPrintf("[Server %d] lastIncludedIndex = %d", kv.me, applyMsg.CommandIndex)
 				continue
 			}
-			op := applyMsg.Command.(Op)
 			kv.mu.Lock()
+			DPrintf("[Server %d] apply %d, %v", kv.me, applyMsg.CommandIndex, applyMsg.Command)
+			if applyMsg.CommandIndex > kv.lastApplied {
+				kv.lastApplied = applyMsg.CommandIndex
+			}
+			op := applyMsg.Command.(Op)
 			maxOpId, hasClient := kv.clientOpId[op.ClientId]
 			if !hasClient || op.OpId > maxOpId {	// not repeated
 				if op.OpType == PUT {
@@ -171,7 +177,7 @@ func (kv *KVServer) applyCommitEntry() {
 			}
 			kv.mu.Unlock()
 			opCh := kv.putOpCh(applyMsg.CommandIndex)
-			go kv.saveSnapShot(applyMsg.CommandIndex)
+			go kv.saveSnapShot()
 			// send op to opCh
 			select {
 			case <- opCh:	// clear the buffered channel
@@ -183,40 +189,51 @@ func (kv *KVServer) applyCommitEntry() {
 }
 
 // save snapshot
-func (kv *KVServer) saveSnapShot(lastSnapshotIndex int) {
+func (kv *KVServer) saveSnapShot(/*lastSnapshotIndex int*/) {
 	kv.mu.Lock()
-	if kv.maxraftstate == -1 || kv.rf.RaftStateSize() < kv.maxraftstate {
+	if kv.maxraftstate == -1 || kv.rf.RaftStateSize() < kv.maxraftstate /*|| kv.lastSnapshotIndex >= lastSnapshotIndex*/ {
 		defer kv.mu.Unlock()
 		return
 	}
+	DPrintf("[Server %d] save snapshot, lastIncludedIndex = %d", kv.me, kv.lastApplied)
 	writer := new(bytes.Buffer)
 	encoder := labgob.NewEncoder(writer)
 	encoder.Encode(kv.kvStorage)
 	encoder.Encode(kv.clientOpId)
+	encoder.Encode(kv.lastApplied)
 	snapshot := writer.Bytes()
+	lastSnapshotIndex := kv.lastApplied
 	kv.mu.Unlock()
 	kv.rf.SaveStateAndSnapshot(lastSnapshotIndex, snapshot)
 }
 
 // read snapshot
-func (kv *KVServer) updateSnapshot(snapshot []byte) {
+func (kv *KVServer) updateSnapshot(snapshot []byte, lastIncludedIndex int) {
 	if snapshot == nil || len(snapshot) < 1 {
 		return
 	}
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
+	if kv.lastApplied > lastIncludedIndex {	// for linearizability
+		return
+	}
+
 	reader := bytes.NewBuffer(snapshot)
 	decoder := labgob.NewDecoder(reader)
 	kvStorage := make(map[string]string)
 	clientOpId := make(map[int64]int64)
+	var lastSnapshotIndex int
 
 	if decoder.Decode(&kvStorage) != nil ||
-		decoder.Decode(&clientOpId) != nil {
+		decoder.Decode(&clientOpId) != nil ||
+		decoder.Decode(&lastSnapshotIndex) != nil {
 		DPrintf("[Server %d] decode fails", kv.me)
 	} else {
 		kv.kvStorage = kvStorage
 		kv.clientOpId = clientOpId
+		kv.lastApplied = lastSnapshotIndex
+		DPrintf("[Server %d] update snapshot, lastIncludedIndex = %d", kv.me, lastSnapshotIndex)
 	}
 }
 
@@ -250,7 +267,8 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.kvStorage = make(map[string]string)
 	kv.opChan = make(map[int]chan Op)
 	kv.clientOpId = make(map[int64]int64)
-	kv.updateSnapshot(kv.rf.ReadSnapshot())
+	kv.lastApplied = 0
+	kv.updateSnapshot(kv.rf.ReadSnapshot(), 0)
 
 	go kv.applyCommitEntry()
 	return kv

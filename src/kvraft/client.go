@@ -52,7 +52,7 @@ func (ck *Clerk) Get(key string) string {
 			ck.leaderId = (ck.leaderId + 1) % len(ck.servers)	// choose another server
 			continue
 		}
-		DPrintf("[Client %d] <Resp> Get op gets resp from server %d", ck.clientId, getReply.ServerId)
+		//DPrintf("[Client %d] <Resp> Get op gets resp from server %d", ck.clientId, getReply.ServerId)
 		if getReply.Err == ErrNoKey {
 			val = ""
 			//DPrintf("[Client %d] <Resp> Get op -- no key %v", ck.clientId, key)
@@ -83,7 +83,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 			ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
 			continue
 		}
-		DPrintf("[Client %d] <Resp> %v op gets resp from server %d", ck.clientId, op, ck.leaderId)
+		//DPrintf("[Client %d] <Resp> %v op gets resp from server %d", ck.clientId, op, ck.leaderId)
 		if putAppendReply.Err == OK {
 			//DPrintf("[Client %d] <Resp> %v <%v, %v> success", ck.clientId, op, key, value)
 		} else {
