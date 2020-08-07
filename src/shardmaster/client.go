@@ -4,14 +4,19 @@ package shardmaster
 // Shardmaster clerk.
 //
 
-import "../labrpc"
-import "time"
-import "crypto/rand"
-import "math/big"
+import (
+	"../labrpc"
+	"time"
+	"crypto/rand"
+	"math/big"
+	"sync/atomic"
+)
 
 type Clerk struct {
-	servers []*labrpc.ClientEnd
-	// Your data here.
+	servers 		[]*labrpc.ClientEnd
+	clientId 		int64
+	leaderId 		int
+	opId 			int64
 }
 
 func nrand() int64 {
@@ -24,78 +29,85 @@ func nrand() int64 {
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
-	// Your code here.
+	ck.clientId = nrand()
+	ck.leaderId = 0
+	ck.opId = 0
 	return ck
 }
 
+// query configuration
 func (ck *Clerk) Query(num int) Config {
-	args := &QueryArgs{}
-	// Your code here.
-	args.Num = num
+	args := QueryArgs{
+		Num:      num,
+		ClientId: ck.clientId,
+		OpId:     atomic.AddInt64(&ck.opId, 1),
+	}
 	for {
-		// try each known server.
-		for _, srv := range ck.servers {
-			var reply QueryReply
-			ok := srv.Call("ShardMaster.Query", args, &reply)
-			if ok && reply.WrongLeader == false {
-				return reply.Config
-			}
+		reply := QueryReply{}
+		ok := ck.servers[ck.leaderId].Call("ShardMaster.Query", &args, &reply)
+		if !ok || reply.WrongLeader {
+			ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
+			time.Sleep(100 * time.Millisecond)
+			continue
 		}
-		time.Sleep(100 * time.Millisecond)
+		return reply.Config
 	}
 }
 
+// join group with servers (GID is key of map)
 func (ck *Clerk) Join(servers map[int][]string) {
-	args := &JoinArgs{}
-	// Your code here.
-	args.Servers = servers
-
+	args := JoinArgs{
+		Servers:  servers,
+		ClientId: ck.clientId,
+		OpId:     atomic.AddInt64(&ck.opId, 1),
+	}
 	for {
-		// try each known server.
-		for _, srv := range ck.servers {
-			var reply JoinReply
-			ok := srv.Call("ShardMaster.Join", args, &reply)
-			if ok && reply.WrongLeader == false {
-				return
-			}
+		reply := JoinReply{}
+		ok := ck.servers[ck.leaderId].Call("ShardMaster.Join", &args, &reply)
+		if !ok || reply.WrongLeader {
+			ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
+			time.Sleep(100 * time.Millisecond)
+			continue
 		}
-		time.Sleep(100 * time.Millisecond)
+		return
 	}
 }
 
+// leave groups
 func (ck *Clerk) Leave(gids []int) {
-	args := &LeaveArgs{}
-	// Your code here.
-	args.GIDs = gids
-
+	args := LeaveArgs{
+		GIDs:     gids,
+		ClientId: ck.clientId,
+		OpId:     atomic.AddInt64(&ck.opId, 1),
+	}
 	for {
-		// try each known server.
-		for _, srv := range ck.servers {
-			var reply LeaveReply
-			ok := srv.Call("ShardMaster.Leave", args, &reply)
-			if ok && reply.WrongLeader == false {
-				return
-			}
+		reply := LeaveReply{}
+		ok := ck.servers[ck.leaderId].Call("ShardMaster.Leave", &args, &reply)
+		if !ok || reply.WrongLeader {
+			ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
+			time.Sleep(100 * time.Millisecond)
+			continue
 		}
-		time.Sleep(100 * time.Millisecond)
+		return
 	}
 }
 
+// move shard to specified group
 func (ck *Clerk) Move(shard int, gid int) {
-	args := &MoveArgs{}
-	// Your code here.
-	args.Shard = shard
-	args.GID = gid
-
+	args := MoveArgs{
+		Shard:    shard,
+		GID:      gid,
+		ClientId: ck.clientId,
+		OpId:     atomic.AddInt64(&ck.opId, 1),
+	}
 	for {
-		// try each known server.
-		for _, srv := range ck.servers {
-			var reply MoveReply
-			ok := srv.Call("ShardMaster.Move", args, &reply)
-			if ok && reply.WrongLeader == false {
-				return
-			}
+		reply := MoveReply{}
+		ok := ck.servers[ck.leaderId].Call("ShardMaster.Move", &args, &reply)
+		if !ok || reply.WrongLeader {
+			ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
+			time.Sleep(100 * time.Millisecond)
+			continue
 		}
-		time.Sleep(100 * time.Millisecond)
+		return
 	}
 }
