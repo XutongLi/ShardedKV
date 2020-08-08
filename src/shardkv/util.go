@@ -1,0 +1,31 @@
+package shardkv
+
+import (
+	"log"
+)
+
+// Debugging
+const Debug = 0
+
+func DPrintf(format string, a ...interface{}) (n int, err error) {
+	if Debug > 0 {
+		log.Printf(format, a...)
+	}
+	return
+}
+
+func Max(a int64, b int64) int64 {
+	if a > b {
+		return a
+	} else {
+		return b
+	}
+}
+
+//func Min(a int, b int) int {
+//	if a < b {
+//		return a
+//	} else {
+//		return b
+//	}
+//}

@@ -8,17 +8,17 @@ package shardkv
 // talks to the group that holds the key's shard.
 //
 
-import "../labrpc"
-import "crypto/rand"
-import "math/big"
-import "../shardmaster"
-import "time"
+import (
+	"../labrpc"
+	"crypto/rand"
+	"math/big"
+	"../shardmaster"
+	"time"
+	"sync/atomic"
+)
 
 //
 // which shard is a key in?
-// please use this function,
-// and please do not change it.
-//
 func key2shard(key string) int {
 	shard := 0
 	if len(key) > 0 {
@@ -28,7 +28,7 @@ func key2shard(key string) int {
 	return shard
 }
 
-func nrand() int64 {
+func Nrand() int64 {
 	max := big.NewInt(int64(1) << 62)
 	bigx, _ := rand.Int(rand.Reader, max)
 	x := bigx.Int64()
@@ -36,10 +36,12 @@ func nrand() int64 {
 }
 
 type Clerk struct {
-	sm       *shardmaster.Clerk
-	config   shardmaster.Config
-	make_end func(string) *labrpc.ClientEnd
-	// You will have to modify this struct.
+	sm       	*shardmaster.Clerk
+	config   	shardmaster.Config
+	make_end 	func(string) *labrpc.ClientEnd
+	//leaderId	int
+	clientId 	int64
+	opId 		int64
 }
 
 //
@@ -55,7 +57,9 @@ func MakeClerk(masters []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 	ck := new(Clerk)
 	ck.sm = shardmaster.MakeClerk(masters)
 	ck.make_end = make_end
-	// You'll have to add code here.
+	ck.clientId = Nrand()
+	ck.leaderId = 0
+	ck.opId = 0
 	return ck
 }
 
@@ -66,9 +70,11 @@ func MakeClerk(masters []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 // You will have to modify this function.
 //
 func (ck *Clerk) Get(key string) string {
-	args := GetArgs{}
-	args.Key = key
-
+	args := GetArgs{
+		Key:      key,
+		ClientId: ck.clientId,
+		OpId:     atomic.AddInt64(&ck.opId, 1),
+	}
 	for {
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
@@ -89,7 +95,7 @@ func (ck *Clerk) Get(key string) string {
 		}
 		time.Sleep(100 * time.Millisecond)
 		// ask master for the latest configuration.
-		ck.config = ck.sm.Query(-1)
+		ck.config = ck.sm.Query(-1)	// get new congiguration
 	}
 
 	return ""
@@ -100,12 +106,13 @@ func (ck *Clerk) Get(key string) string {
 // You will have to modify this function.
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	args := PutAppendArgs{}
-	args.Key = key
-	args.Value = value
-	args.Op = op
-
-
+	args := PutAppendArgs{
+		Key:      key,
+		Value:    value,
+		Op:       op,
+		ClientId: ck.clientId,
+		OpId:     atomic.AddInt64(&ck.opId, 1),
+	}
 	for {
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
