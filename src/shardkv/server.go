@@ -1,5 +1,30 @@
 package shardkv
 
+/*
+ * Design:
+ * periodly get new configure, add it to raft log
+ * * when new configure log applied, fill sendShards and getShards, delete old kv data
+ * periodly get shard in getShards from other groups via RPC
+ * * when get OK reply, add it to raft log
+ * * when Migrate reply log applied, update DB with migrated data, delete data in getShards, update garbages
+ * periodly collect garbage, send shards in garbages to other groups via RPC
+ * * when server get GC RPC, add it to raft log
+ * * when GC log applied, delete shards in sendShards
+ */
+
+/*
+ * Challenge:
+ * Garbage Collection:
+ * * when new configure log applied, fill sendShards and getShards, delete old kv data
+ * * when Migrate reply log applied, update DB with migrated data, delete data in getShards, update garbages
+ * * when GC log applied, delete shards in sendShards
+ * Keys in unaffected shards continue to execute during a configuration change
+ * * data that would be got is in getShards, data that would be sent is in sendShards
+ * * so the unaffected shards can continue to execute
+ * Raft groups start serving shards the moment they are able to
+ * * when Migrate Reply log applied, the DB will be changed, then the new shards can be served
+ */
+
 import (
 	"../shardmaster"
 	"../labrpc"
@@ -8,6 +33,7 @@ import (
 	"sync"
 	"../labgob"
 	"time"
+	"bytes"
 )
 
 type Op struct {
@@ -15,7 +41,7 @@ type Op struct {
 	Value 		string
 	OpType 		string
 	ClientId 	int64
-	OpId 		int64
+	OpId 		int
 }
 
 type ShardKV struct {
@@ -33,7 +59,7 @@ type ShardKV struct {
 	cfg 			shardmaster.Config
 	persist 		*raft.Persister
 	kvStorage		map[string]string		// kv storage
-	clientOpId 		map[int64]int64			// <clientId, max OpId of this client >
+	clientOpId 		map[int64]int			// <clientId, max OpId of this client >
 	opChan			map[int]chan Op			// <index, chan>
 	lastApplied		int
 
@@ -53,16 +79,16 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 		OpId:     args.OpId,
 	}
 	reply.Err = ErrWrongLeader
-	getOp, success := kv.execRaft(op)
-	if !success {
-		return
-	}
+	getOp, _ := kv.execRaft(op)
+	//if !success {
+	//	return
+	//}
 	if kv.equalTo(op, getOp) {
 		reply.Err = OK
-		reply.Value = op.Value
+		reply.Value = getOp.Value
 		return
 	}
-	if op.OpType == ErrWrongGroup {
+	if getOp.OpType == ErrWrongGroup {
 		reply.Err = ErrWrongGroup
 	}
 }
@@ -77,15 +103,15 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		OpId:     args.OpId,
 	}
 	reply.Err = ErrWrongLeader
-	getOp, success := kv.execRaft(op)
-	if !success {
-		return
-	}
+	getOp, _ := kv.execRaft(op)
+	//if !success {
+	//	return
+	//}
 	if kv.equalTo(op, getOp) {
 		reply.Err = OK
 		return
 	}
-	if op.OpType == ErrWrongGroup {
+	if getOp.OpType == ErrWrongGroup {
 		reply.Err = ErrWrongGroup
 	}
 }
@@ -96,7 +122,7 @@ func (kv *ShardKV) execRaft(op Op) (Op, bool) {
 	if !isLeader {
 		return Op{}, false
 	}
-	//DPrintf("[Server %d] get %v request from %d, <%v, %v>", kv.me, op, op.ClientId, op.Key, op.Value)
+	DPrintf("[Server %d] get %v request from %d, <%v, %v>", kv.me, op, op.ClientId, op.Key, op.Value)
 	opCh := kv.putOpCh(logIndex)
 	select {
 	case getOp := <-opCh:
@@ -118,7 +144,7 @@ func (kv *ShardKV) putOpCh(index int) chan Op {
 
 //Check that a and b are equal
 func (kv *ShardKV) equalTo(a Op, b Op) bool {
-	return a.ClientId == b.ClientId && a.OpId == b.OpId && a.Key == b.Key && a.Value == b.Value && a.OpType == b.OpType
+	return a.ClientId == b.ClientId && a.OpId == b.OpId && a.Key == b.Key && a.OpType == b.OpType
 }
 
 
@@ -130,74 +156,79 @@ func (kv *ShardKV) equalTo(a Op, b Op) bool {
 //
 func (kv *ShardKV) Kill() {
 	kv.rf.Kill()
+	select {
+	case <-kv.killChan:
+	default:
+	}
 	kv.killChan <- true
 }
 
-//  periodically poll the shardmaster to learn about new configurations
-func (kv *ShardKV) pollShardmaster() {
+func (kv *ShardKV) gouroutine(function func(), sleepTime int) {
 	for {
 		select {
 		case <- kv.killChan:
 			return
 		default:
-			_, isLeader := kv.rf.GetState()
-			kv.mu.Lock()
-			if !isLeader || len(kv.getShards) > 0 {	// refuse to query shardmaster while there are shards to be get
-				defer kv.mu.Unlock()
-				return
-			}
-			oldcfgNum := kv.cfg.Num
-			kv.mu.Unlock()
-			newCfg := kv.mck.Query(-1)	// find the newest configuration
-			if newCfg.Num > oldcfgNum {
-				kv.rf.Start(newCfg)	// add new configuration to raft log
-			}
+			function()
 		}
-		time.Sleep(time.Duration(POLLSHARDMASTER) * time.Millisecond)
+		time.Sleep(time.Duration(sleepTime) * time.Millisecond)
+	}
+}
+
+//  periodically poll the shardmaster to learn about new configurations
+func (kv *ShardKV) pollShardmaster() {
+	//DPrintf("[Server %v] pollShardmaster", kv.me)
+	_, isLeader := kv.rf.GetState()
+	kv.mu.Lock()
+	if !isLeader || len(kv.getShards) > 0 {	// refuse to query shardmaster while there are shards to be get
+		defer kv.mu.Unlock()
+		return
+	}
+	next := kv.cfg.Num + 1
+	kv.mu.Unlock()
+	cfg := kv.mck.Query(next)
+	if cfg.Num == next {
+		DPrintf("[Server %d] add config change log", kv.me)
+		kv.rf.Start(cfg)
 	}
 }
 
 // periodically get shards from other raft group
 func (kv *ShardKV) migrateShard() {
-	for {
-		select {
-		case <- kv.killChan:
-			return
-		default:
-			_, isLeader := kv.rf.GetState()
-			kv.mu.Lock()
-			if !isLeader || len(kv.getShards) == 0 {
-				defer kv.mu.Unlock()
-				return
-			}
-			var wait sync.WaitGroup
-			for shard, idx := range kv.getShards {
-				wait.Add(1)
-				go func(shard int, cfg shardmaster.Config) {
-					defer wait.Done()
-					args := MigrateArgs{
-						Shard:     shard,
-						ConfigNum: cfg.Num,
-					}
-					gid := cfg.Shards[shard]
-					for _, server := range cfg.Groups[gid] {
-						svr := kv.make_end(server)
-						reply := MigrateReply{}
-						ok := svr.Call("ShardKV.ShardMigration", &args, &reply)
-						if ok && reply.Err == Ok {
-							kv.rf.Start(reply)	// add new shards to raft log
-						}
-					}
-				}(shard, kv.mck.Query(idx))
-			}
-			kv.mu.Unlock()
-			wait.Wait()
-		}
-		time.Sleep(time.Duration(MIGRATESHARD) * time.Millisecond)
+	//DPrintf("[Server %v] migrateShard", kv.me)
+	_, isLeader := kv.rf.GetState()
+	kv.mu.Lock()
+	if !isLeader || len(kv.getShards) == 0 {
+		defer kv.mu.Unlock()
+		return
 	}
+	var wait sync.WaitGroup
+	for shard, idx := range kv.getShards {
+		wait.Add(1)
+		go func(shard int, cfg shardmaster.Config) {
+			defer wait.Done()
+			args := MigrateArgs{
+				Shard:     shard,
+				ConfigNum: cfg.Num,
+			}
+			gid := cfg.Shards[shard]
+			for _, server := range cfg.Groups[gid] {
+				svr := kv.make_end(server)
+				reply := MigrateReply{}
+				ok := svr.Call("ShardKV.ShardMigration", &args, &reply)
+				if ok && reply.Err == OK {
+					DPrintf("[Server %v] add new shard to raft log", kv.me)
+					kv.rf.Start(reply)	// add new shards to raft log
+				}
+			}
+		}(shard, kv.mck.Query(idx))
+	}
+	kv.mu.Unlock()
+	wait.Wait()
 }
 
 // ShardMigration RPC Handler
+// reply data in sendShards of shards indicated by args
 func (kv *ShardKV) ShardMigration(args *MigrateArgs, reply *MigrateReply) {
 	reply.Err = ErrWrongLeader
 	reply.Shard = args.Shard
@@ -217,57 +248,51 @@ func (kv *ShardKV) ShardMigration(args *MigrateArgs, reply *MigrateReply) {
 	for key, val := range kv.sendShards[args.ConfigNum][args.Shard] {
 		reply.Data[key] = val
 	}
-	reply.ClientOpId = make(map[int64]int64)
+	reply.ClientOpId = make(map[int64]int)
 	for clientId, opId := range kv.clientOpId {
 		reply.ClientOpId[clientId] = opId
 	}
 }
 
 // periodically collect garbage
+// tell other group to remove sendShards of some shard
 func (kv *ShardKV) garbageCollect() {
-	for {
-		select {
-		case <- kv.killChan:
-			return
-		default:
-			_, isLeader := kv.rf.GetState()
-			kv.mu.Lock()
-			if !isLeader || len(kv.garbages) == 0 {
-				kv.mu.Unlock()
-				return
-			}
-			var wait sync.WaitGroup
-			for cfgNum, shards := range kv.garbages {
-				for shard := range shards {
-					wait.Add(1)
-					go func(shard int, cfg shardmaster.Config) {
-						defer wait.Done()
-						args := MigrateArgs{
-							Shard:     shard,
-							ConfigNum: cfg.Num,
-						}
-						gid := cfg.Shards[shard]
-						for _, server := range cfg.Groups[gid] {
-							svr := kv.make_end(server)
-							reply := MigrateReply{}
-							ok := svr.Call("ShardKV.GarbageCollection", &args, &reply)
-							if ok && reply.Err == Ok {
-								kv.mu.Lock()
-								defer kv.mu.Unlock()
-								delete(kv.garbages[cfgNum], shard)
-								if len(kv.garbages[cfgNum]) == 0 {
-									delete(kv.garbages, cfgNum)
-								}
-							}
-						}
-					}(shard, kv.mck.Query(cfgNum))
-				}
-			}
-			kv.mu.Unlock()
-			wait.Wait()
-		}
-		time.Sleep(time.Duration(GARBAGETIME) * time.Millisecond)
+	//DPrintf("[Server %v] garbageCollect", kv.me)
+	_, isLeader := kv.rf.GetState()
+	kv.mu.Lock()
+	if !isLeader || len(kv.garbages) == 0 {
+		defer kv.mu.Unlock()
+		return
 	}
+	var wait sync.WaitGroup
+	for cfgNum, shards := range kv.garbages {
+		for shard := range shards {
+			wait.Add(1)
+			go func(shard int, cfg shardmaster.Config) {
+				defer wait.Done()
+				args := MigrateArgs{
+					Shard:     shard,
+					ConfigNum: cfg.Num,
+				}
+				gid := cfg.Shards[shard]
+				for _, server := range cfg.Groups[gid] {
+					svr := kv.make_end(server)
+					reply := MigrateReply{}
+					ok := svr.Call("ShardKV.GarbageCollection", &args, &reply)
+					if ok && reply.Err == OK {
+						kv.mu.Lock()
+						defer kv.mu.Unlock()
+						delete(kv.garbages[cfgNum], shard)
+						if len(kv.garbages[cfgNum]) == 0 {
+							delete(kv.garbages, cfgNum)
+						}
+					}
+				}
+			}(shard, kv.mck.Query(cfgNum))
+		}
+	}
+	kv.mu.Unlock()
+	wait.Wait()
 }
 
 func (kv *ShardKV) GarbageCollection(args *MigrateArgs, reply *MigrateReply) {
@@ -300,7 +325,7 @@ func (kv *ShardKV) GarbageCollection(args *MigrateArgs, reply *MigrateReply) {
 		reply.Err = OK
 		return
 	}
-	if op.OpType == ErrWrongGroup {
+	if getOp.OpType == ErrWrongGroup {
 		reply.Err = ErrWrongGroup
 	}
 }
@@ -319,10 +344,11 @@ func (kv *ShardKV) applyCommitEntry() {
 				continue
 			}
 			kv.mu.Lock()
-			//DPrintf("[Server %d] apply %d, %v", kv.me, applyMsg.CommandIndex, applyMsg.Command)
+			DPrintf("[Server %d] apply %d, %v", kv.me, applyMsg.CommandIndex, applyMsg.Command)
 			if applyMsg.CommandIndex > kv.lastApplied {
 				kv.lastApplied = applyMsg.CommandIndex
 			}
+			kv.mu.Unlock()
 			if cfg, ok := applyMsg.Command.(shardmaster.Config); ok {
 				kv.execNewConfig(cfg)
 			} else if migData, ok := applyMsg.Command.(MigrateReply); ok {
@@ -336,7 +362,6 @@ func (kv *ShardKV) applyCommitEntry() {
 					kv.applyCommand(&op)
 				}
 				opCh := kv.putOpCh(applyMsg.CommandIndex)
-				go kv.saveSnapShot()
 				// send op to opCh
 				select {
 				case <- opCh:	// clear the buffered channel
@@ -344,6 +369,7 @@ func (kv *ShardKV) applyCommitEntry() {
 				}
 				opCh <- op		// send op
 			}
+			go kv.saveSnapShot()
 		}
 	}
 }
@@ -356,6 +382,7 @@ func (kv *ShardKV) applyCommand(op *Op) {
 	if _, ok := kv.containShards[shard]; !ok {
 		op.OpType = ErrWrongGroup
 	} else {
+		DPrintf("[Server %v] not wrong group", kv.me)
 		maxOpId, hasClient := kv.clientOpId[op.ClientId]
 		if !hasClient || op.OpId > maxOpId {	// not repeated
 			if op.OpType == PUT {
@@ -386,6 +413,7 @@ func (kv *ShardKV) execGC(cfgNum int, shard int) {
 // update shard to new configuration
 // fill getShards and sendShards
 func (kv *ShardKV) execNewConfig(cfg shardmaster.Config) {
+	DPrintf("[Server %d] get new config", kv.me)
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 	if cfg.Num <= kv.cfg.Num {
@@ -397,6 +425,7 @@ func (kv *ShardKV) execNewConfig(cfg shardmaster.Config) {
 		if gid != kv.gid {
 			continue
 		}
+		//kv.containShards[shard] = true
 		if _, ok := containShards[shard]; ok || oldCfg.Num == 0 {	// existed shard
 			kv.containShards[shard] = true
 			delete(containShards, shard)
@@ -421,6 +450,7 @@ func (kv *ShardKV) execNewConfig(cfg shardmaster.Config) {
 
 // add new migrate data to kv
 func (kv *ShardKV) updateDBWithMigrateData(migrateData MigrateReply) {
+	DPrintf("[Server %v] update DB with MigrateData", kv.me)
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 	if migrateData.ConfigNum != kv.cfg.Num - 1 {
@@ -480,7 +510,7 @@ func (kv *ShardKV) updateSnapshot(snapshot []byte, lastIncludedIndex int) {
 	reader := bytes.NewBuffer(snapshot)
 	decoder := labgob.NewDecoder(reader)
 	kvStorage := make(map[string]string)
-	clientOpId := make(map[int64]int64)
+	clientOpId := make(map[int64]int)
 	sendShards := make(map[int]map[int]map[string]string)
 	getShards := make(map[int]int)
 	containShards := make(map[int]bool)
@@ -559,7 +589,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.killChan = make(chan bool, 1)
 	kv.kvStorage = make(map[string]string)
 	kv.opChan = make(map[int]chan Op)
-	kv.clientOpId = make(map[int64]int64)
+	kv.clientOpId = make(map[int64]int)
 	kv.lastApplied = 0
 	kv.garbages = make(map[int]map[int]bool)
 	kv.getShards = make(map[int]int)
@@ -568,9 +598,10 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 
 	kv.updateSnapshot(kv.rf.ReadSnapshot(), 0)
 
+	go kv.gouroutine(kv.pollShardmaster, POLLSHARDMASTER)
+	go kv.gouroutine(kv.migrateShard, MIGRATESHARD)
+	go kv.gouroutine(kv.garbageCollect, GARBAGETIME)
 	go kv.applyCommitEntry()
-	go kv.migrateShard()
-	go kv.garbageCollect()
 
 	return kv
 }

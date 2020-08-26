@@ -10,11 +10,10 @@ package shardkv
 
 import (
 	"../labrpc"
+	"../shardmaster"
 	"crypto/rand"
 	"math/big"
-	"../shardmaster"
 	"time"
-	"sync/atomic"
 )
 
 //
@@ -39,9 +38,9 @@ type Clerk struct {
 	sm       	*shardmaster.Clerk
 	config   	shardmaster.Config
 	make_end 	func(string) *labrpc.ClientEnd
-	//leaderId	int
+	leaderId	int
 	clientId 	int64
-	opId 		int64
+	opId 		int
 }
 
 //
@@ -67,24 +66,28 @@ func MakeClerk(masters []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 // fetch the current value for a key.
 // returns "" if the key does not exist.
 // keeps trying forever in the face of all other errors.
-// You will have to modify this function.
 //
 func (ck *Clerk) Get(key string) string {
+	ck.opId += 1
 	args := GetArgs{
-		Key:      key,
-		ClientId: ck.clientId,
-		OpId:     atomic.AddInt64(&ck.opId, 1),
+		Key:      	key,
+		ClientId: 	ck.clientId,
+		OpId:	  	ck.opId,
 	}
 	for {
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
 		if servers, ok := ck.config.Groups[gid]; ok {
 			// try each server for the shard.
-			for si := 0; si < len(servers); si++ {
-				srv := ck.make_end(servers[si])
+			for si := 0; si < len(servers); si ++ {
+				svr := (si + ck.leaderId) % len(servers)
+				srv := ck.make_end(servers[svr])
 				var reply GetReply
+				DPrintf("[Client %v] send Get", ck.clientId)
 				ok := srv.Call("ShardKV.Get", &args, &reply)
+				DPrintf("[Client %v] get Get Resp %v", ck.clientId, reply.Err)
 				if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
+					ck.leaderId = svr
 					return reply.Value
 				}
 				if ok && (reply.Err == ErrWrongGroup) {
@@ -103,25 +106,29 @@ func (ck *Clerk) Get(key string) string {
 
 //
 // shared by Put and Append.
-// You will have to modify this function.
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
+	ck.opId += 1
 	args := PutAppendArgs{
-		Key:      key,
-		Value:    value,
-		Op:       op,
-		ClientId: ck.clientId,
-		OpId:     atomic.AddInt64(&ck.opId, 1),
+		Key:      	key,
+		Value:    	value,
+		Op:       	op,
+		ClientId: 	ck.clientId,
+		OpId:	  	ck.opId,
 	}
 	for {
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
 		if servers, ok := ck.config.Groups[gid]; ok {
-			for si := 0; si < len(servers); si++ {
-				srv := ck.make_end(servers[si])
+			for si := 0; si < len(servers); si ++ {
+				svr := (si + ck.leaderId) % len(servers)
+				srv := ck.make_end(servers[svr])
 				var reply PutAppendReply
+				DPrintf("[Client %v] send PutAppend", ck.clientId)
 				ok := srv.Call("ShardKV.PutAppend", &args, &reply)
+				DPrintf("[Client %v] get PutAppend Resp %v", ck.clientId, reply.Err)
 				if ok && reply.Err == OK {
+					ck.leaderId = svr
 					return
 				}
 				if ok && reply.Err == ErrWrongGroup {
